@@ -35,8 +35,10 @@ WANDB_PROJECT=trl \
 accelerate launch \
     --num_processes 1 \
     --config_file examples/accelerate_configs/deepspeed_zero3.yaml \
-    examples/scripts/gspo.py \
+    examples/scripts/gspo_tir.py \
     --model_name_or_path Qwen/Qwen2.5-0.5B \
+    --teacher_model_name_or_path Qwen/Qwen2.5-3B \
+    --logit_fusion_alpha 0.5 \
     --output_dir /cmlscratch/juzheng/trl/checkpoints/gspo-Qwen2.5-0.5B \
     --learning_rate 1e-5 \
     --dtype bfloat16 \
@@ -55,18 +57,12 @@ accelerate launch \
     --gradient_accumulation_steps 2 \
     --steps_per_generation 8 \
     --report_to wandb \
-    --run_name Qwen2.5-0.5B-baseline \
+    --run_name Qwen2.5-0.5B-alpha-0.5 \
     --num_completions_to_print 2 \
-    --difficulty_tier 1 \
-    --eval_strategy steps \
-    --eval_steps 100 \
-    --save_strategy steps \
-    --save_steps 1000
-
+    --eval_strategy steps
 """
 
 import os
-import re
 
 import torch
 from datasets import load_dataset
@@ -85,12 +81,26 @@ from trl import (
 from trl.rewards import accuracy_reward, think_format_reward
 
 
+@dataclass
+class TeacherConfig:
+    teacher_model_name_or_path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional frozen off-policy teacher model used for logit fusion during rollouts. Must share the "
+            "same vocabulary as the policy model."
+        },
+    )
+    teacher_model_revision: str | None = field(
+        default=None, metadata={"help": "Revision of the teacher model to use (branch, tag, or commit hash)."}
+    )
+
+
 # Enable logging in a Hugging Face Space
 os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, GRPOConfig, ModelConfig))
-    script_args, training_args, model_args = parser.parse_args_and_config()
+    parser = TrlParser((ScriptArguments, GRPOConfig, ModelConfig, TeacherConfig))
+    script_args, training_args, model_args, teacher_args = parser.parse_args_and_config()
     ################
     # Model & Processor
     ################
@@ -106,9 +116,9 @@ if __name__ == "__main__":
         training_args.model_init_kwargs["device_map"] = get_kbit_device_map()
         training_args.model_init_kwargs["quantization_config"] = quantization_config
 
-    if training_args.teacher_model_name_or_path is not None:
+    if teacher_args.teacher_model_name_or_path is not None:
         training_args.teacher_model_init_kwargs = dict(
-            revision=training_args.teacher_model_revision or model_args.model_revision,
+            revision=teacher_args.teacher_model_revision or model_args.model_revision,
             attn_implementation=model_args.attn_implementation,
             dtype=dtype,
         )
@@ -119,80 +129,37 @@ if __name__ == "__main__":
     ################
     # Dataset
     ################
-    train_dataset, eval_dataset = load_dataset("juzhengz/DeepMath-103K", split=["train", "test[:100]"])
-    tier_value = training_args.difficulty_tier
-    if isinstance(tier_value, str) and tier_value.lower() == "all":
-        pass
-    else:
-        expr = str(tier_value).strip()
-        numeric_value: float | None = None
-        try:
-            numeric_value = float(expr)
-        except (TypeError, ValueError):
-            numeric_value = None
+    train_dataset, eval_dataset = load_dataset("AI-MO/NuminaMath-TIR", split=["train[:5%]", "test[:5%]"])
 
-        if numeric_value is not None:
-            target = numeric_value
-            target_half = numeric_value + 0.5
-            train_dataset = train_dataset.filter(
-                lambda example: float(example["difficulty"]) == target
-                or float(example["difficulty"]) == target_half
-            )
-        else:
-            match = re.search(r"(<=|>=|==|!=|<|>)\s*([0-9]+(?:\.[0-9]+)?)", expr)
-            if match is None:
-                raise ValueError(
-                    f"Unsupported difficulty_tier: {training_args.difficulty_tier}. "
-                    "Use 'all', a number like 4, or a comparison like '< 4'."
-                )
-            op, threshold_str = match.groups()
-            threshold = float(threshold_str)
-            if op == "<":
-                train_dataset = train_dataset.filter(lambda example: float(example["difficulty"]) < threshold)
-            elif op == "<=":
-                train_dataset = train_dataset.filter(lambda example: float(example["difficulty"]) <= threshold)
-            elif op == ">":
-                train_dataset = train_dataset.filter(lambda example: float(example["difficulty"]) > threshold)
-            elif op == ">=":
-                train_dataset = train_dataset.filter(lambda example: float(example["difficulty"]) >= threshold)
-            elif op == "==":
-                train_dataset = train_dataset.filter(lambda example: float(example["difficulty"]) == threshold)
-            elif op == "!=":
-                train_dataset = train_dataset.filter(lambda example: float(example["difficulty"]) != threshold)
-
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Eval dataset size: {len(eval_dataset)}")
-    # SYSTEM_PROMPT = (
-    #     "A conversation between user and assistant. The user asks a question, and the assistant solves it. The "
-    #     "assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-    #     "The reasoning process and answer are enclosed within <think></think> tags, i.e., <think>\nThis is my "
-    #     "reasoning.\n</think>\nThis is my answer."
-    # )
     SYSTEM_PROMPT = (
-        "A conversation between a user and an assistant. The user asks a question, and the assistant solves it.\n"
-        "The assistant should reason step by step, then provide the final answer.\n"
-        "The reasoning process must be enclosed within <think></think> tags.\n"
-        "The final answer must be written in valid LaTeX and MUST be enclosed in \\boxed{...}. "
-        "Answers not enclosed in \\boxed{...} will be considered incorrect.\n"
+        "A conversation between user and assistant. The user asks a question, and the assistant solves it. The "
+        "assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+        "The reasoning process and answer are enclosed within <think></think> tags, i.e., <think>\nThis is my "
+        "reasoning.\n</think>\nThis is my answer."
     )
-    
+
     def make_conversation(example):
-        prompt = example["prompt"]
         return {
-            "prompt": [{"role": "system", "content": SYSTEM_PROMPT}, *prompt],
+            "prompt": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": example["problem"]},
+            ],
         }
 
     train_dataset = train_dataset.map(make_conversation)
     eval_dataset = eval_dataset.map(make_conversation)
+
+    train_dataset = train_dataset.remove_columns(["messages", "problem"])
+    eval_dataset = eval_dataset.remove_columns(["messages", "problem"])
 
     ################
     # Training
     ################
     trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
-        teacher_model=training_args.teacher_model_name_or_path,
+        teacher_model=teacher_args.teacher_model_name_or_path,
         args=training_args,
-        reward_funcs=accuracy_reward,
+        reward_funcs=[accuracy_reward],
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=get_peft_config(model_args),

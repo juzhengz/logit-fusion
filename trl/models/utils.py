@@ -265,10 +265,11 @@ def unwrap_model_for_generation(
         else:
             import deepspeed
 
+            remove_hooks(model)
             with deepspeed.zero.GatheredParameters(model.parameters()):
-                remove_hooks(model)
                 yield accelerator.unwrap_model(model)
-                add_hooks(model)
+            # Re-register hooks only after parameters have been re-partitioned to avoid "param in flight" errors
+            add_hooks(model)
     else:
         yield unwrapped_model
     if is_gradient_checkpointing:

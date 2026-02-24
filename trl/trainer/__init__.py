@@ -37,6 +37,7 @@ _import_structure = {
     "gkd_trainer": ["GKDTrainer"],
     "grpo_config": ["GRPOConfig"],
     "grpo_trainer": ["GRPOTrainer"],
+    "opd_trainer": ["OnPolicyDistillationTrainer"],
     "judges": [
         "AllTrueJudge",
         "BaseBinaryJudge",
@@ -97,6 +98,7 @@ if TYPE_CHECKING:
     from .gkd_trainer import GKDTrainer
     from .grpo_config import GRPOConfig
     from .grpo_trainer import GRPOTrainer
+    from .opd_trainer import OnPolicyDistillationTrainer
     from .judges import (
         AllTrueJudge,
         BaseBinaryJudge,

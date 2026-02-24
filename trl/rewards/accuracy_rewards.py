@@ -12,12 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
 from ..import_utils import is_math_verify_available
 
 
 if is_math_verify_available():
     from latex2sympy2_extended import NormalizationConfig
     from math_verify import LatexExtractionConfig, parse, verify
+
+
+def _get_timeout_from_env(name: str, default: int | None) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value_lower = value.strip().lower()
+    if value_lower in {"none", "null", "off", "disable", "disabled", "0"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str], **kwargs) -> list[float | None]:
@@ -53,8 +68,10 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
 
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
+    parsing_timeout = _get_timeout_from_env("TRL_MATH_VERIFY_PARSING_TIMEOUT", 5)
+    verify_timeout = _get_timeout_from_env("TRL_MATH_VERIFY_VERIFY_TIMEOUT", 5)
     for content, sol in zip(contents, solution, strict=True):
-        gold_parsed = parse(sol)
+        gold_parsed = parse(sol, parsing_timeout=parsing_timeout)
         if len(gold_parsed) != 0:
             # We require the answer to be provided in correct latex (no malformed operators)
             answer_parsed = parse(
@@ -68,8 +85,9 @@ def accuracy_reward(completions: list[list[dict[str, str]]], solution: list[str]
                     )
                 ],
                 extraction_mode="first_match",
+                parsing_timeout=parsing_timeout,
             )
-            reward = float(verify(gold_parsed, answer_parsed))
+            reward = float(verify(gold_parsed, answer_parsed, timeout_seconds=verify_timeout))
         else:
             # If the gold solution cannot be parsed, we assign `None` to skip this example
             reward = None
@@ -140,6 +158,8 @@ def reasoning_accuracy_reward(
 
     rewards = []
     contents = [completion[0]["content"] for completion in completions]
+    parsing_timeout = _get_timeout_from_env("TRL_MATH_VERIFY_PARSING_TIMEOUT", 5)
+    verify_timeout = _get_timeout_from_env("TRL_MATH_VERIFY_VERIFY_TIMEOUT", 5)
     for content, sol in zip(contents, solution, strict=True):
         # Split final answer from reasoning content
         is_reasoning_complete = False
@@ -153,7 +173,7 @@ def reasoning_accuracy_reward(
             rewards.append(0.0)
             continue
 
-        gold_parsed = parse(sol)
+        gold_parsed = parse(sol, parsing_timeout=parsing_timeout)
         if len(gold_parsed) != 0:
             # We require the answer to be provided in correct latex (no malformed operators)
             answer_parsed = parse(
@@ -168,8 +188,9 @@ def reasoning_accuracy_reward(
                     )
                 ],
                 extraction_mode="first_match",
+                parsing_timeout=parsing_timeout,
             )
-            reward = float(verify(gold_parsed, answer_parsed))
+            reward = float(verify(gold_parsed, answer_parsed, timeout_seconds=verify_timeout))
         else:
             # If the gold solution cannot be parsed, we assign `None` to skip this example
             reward = None

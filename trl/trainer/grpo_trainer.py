@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import math
 import os
 import textwrap
 import time
@@ -36,6 +37,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Sampler
 from transformers import (
     AutoModelForSequenceClassification,
+    AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
     GenerationConfig,
@@ -47,6 +49,7 @@ from transformers import (
     is_trackio_available,
     is_wandb_available,
 )
+from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 from transformers.trainer_utils import seed_worker
 from transformers.utils import is_datasets_available, is_peft_available, is_rich_available
 
@@ -98,8 +101,8 @@ if is_vllm_available():
 if is_wandb_available():
     import wandb
 
-if is_trackio_available():
-    import trackio
+# if is_trackio_available():
+#     import trackio
 
 if is_bitsandbytes_available():
     import bitsandbytes as bnb
@@ -114,6 +117,101 @@ RewardFunc = str | PreTrainedModel | Callable[[list, list], list[float]]
 # returns a dict of generation results. Those results must include "prompt_ids", "completion_ids", and "logprobs"
 # fields. Any extra fields (per-completion) are forwarded to the reward functions.
 RolloutFunc = Callable[[list[str], "GRPOTrainer"], dict[str, Any]]
+
+
+class LogitsFusionProcessor(LogitsProcessor):
+    """
+    A logits processor that linearly fuses logits from a frozen teacher model with the active policy logits.
+    """
+
+    def __init__(
+        self,
+        teacher_model: PreTrainedModel,
+        alpha: float,
+        pad_token_id: int,
+        supports_use_cache: bool,
+        alpha_scales: torch.Tensor | None = None,
+    ):
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError("`alpha` for logit fusion must be between 0.0 and 1.0.")
+        self.teacher_model = teacher_model
+        self.alpha = alpha
+        self.pad_token_id = pad_token_id
+        self.supports_use_cache = supports_use_cache
+        self.alpha_scales = alpha_scales
+        # Cache to avoid recomputing teacher prefix on every decoding step
+        self._past_key_values = None
+        self._cached_batch_size = None
+        self._cached_seq_len = None
+
+    @torch.no_grad()
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        attention_mask = (input_ids != self.pad_token_id).long()
+        batch_size, seq_len = input_ids.shape
+
+        use_cache = self.supports_use_cache
+        if self.alpha_scales is not None:
+            if self.alpha_scales.shape[0] != batch_size:
+                raise ValueError(
+                    "alpha_scales batch size {} does not match input batch size {}.".format(
+                        self.alpha_scales.shape[0], batch_size
+                    )
+                )
+            alpha_tensor = self.alpha_scales.to(dtype=scores.dtype, device=scores.device)
+            alpha_tensor = (alpha_tensor * float(self.alpha)).clamp(0.0, 1.0)
+            if torch.all(alpha_tensor <= 0.0):
+                return scores
+        else:
+            alpha_tensor = None
+
+        cache_is_valid = (
+            use_cache
+            and self._past_key_values is not None
+            and self._cached_batch_size == batch_size
+            and self._cached_seq_len is not None
+            and seq_len == self._cached_seq_len + 1  # step-wise decoding
+        )
+
+        if cache_is_valid:
+            teacher_inputs = {
+                "input_ids": input_ids[:, -1:],
+                "attention_mask": attention_mask,
+                "past_key_values": self._past_key_values,
+                "use_cache": True,
+            }
+        else:
+            # Reset cache when shape changes or first call
+            self._past_key_values = None
+            self._cached_batch_size = batch_size
+            self._cached_seq_len = seq_len
+            teacher_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "use_cache": use_cache,
+            }
+
+        teacher_outputs = self.teacher_model(**teacher_inputs)
+        teacher_logits = teacher_outputs.logits[:, -1, :]
+
+        if use_cache and teacher_outputs.past_key_values is not None:
+            self._past_key_values = teacher_outputs.past_key_values
+            self._cached_seq_len = seq_len
+
+        teacher_logits = teacher_logits.to(dtype=scores.dtype, device=scores.device)
+        if teacher_logits.size(1) != scores.size(1):
+            if teacher_logits.size(1) < scores.size(1):
+                raise ValueError(
+                    "Teacher logits vocab size {} is smaller than policy logits vocab size {}.".format(
+                        teacher_logits.size(1), scores.size(1)
+                    )
+                )
+            teacher_logits = teacher_logits[:, : scores.size(1)]
+        if alpha_tensor is None:
+            fused_scores = self.alpha * teacher_logits + (1 - self.alpha) * scores
+        else:
+            alpha_tensor = alpha_tensor.view(-1, 1)
+            fused_scores = alpha_tensor * teacher_logits + (1 - alpha_tensor) * scores
+        return fused_scores
 
 
 class GRPOTrainer(BaseTrainer):
@@ -149,6 +247,10 @@ class GRPOTrainer(BaseTrainer):
               using [`~transformers.AutoModelForCausalLM.from_pretrained`] with the keyword arguments in
               `args.model_init_kwargs`.
             - A [`~transformers.PreTrainedModel`] object. Only causal language models are supported.
+        teacher_model (`str | PreTrainedModel`, *optional*):
+            Frozen off-policy teacher model used to linearly fuse its logits with the on-policy model logits during
+            rollout sampling. Must share the same vocabulary as the policy model. Only supported with the standard
+            transformers generation path (i.e., when not using vLLM or paged generation).
         reward_funcs (`RewardFunc | list[RewardFunc]`):
             Reward functions to be used for computing the rewards. To compute the rewards, we call all the reward
             functions with the prompts and completions and sum the rewards. Can be either:
@@ -237,6 +339,7 @@ class GRPOTrainer(BaseTrainer):
         self,
         model: str | PreTrainedModel,
         reward_funcs: RewardFunc | list[RewardFunc],
+        teacher_model: str | PreTrainedModel | None = None,
         args: GRPOConfig | None = None,
         train_dataset: Dataset | IterableDataset | None = None,
         eval_dataset: Dataset | IterableDataset | dict[str, Dataset | IterableDataset] | None = None,
@@ -293,6 +396,7 @@ class GRPOTrainer(BaseTrainer):
         self.pad_token = tokenizer.pad_token
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
+        self.eos_token_ids = [self.eos_token_id] if self.eos_token_id is not None else []
 
         if is_peft_available() and isinstance(model, PeftModel) and peft_config is not None:
             # If the model is already a PeftModel, we need to merge and unload it.
@@ -398,18 +502,23 @@ class GRPOTrainer(BaseTrainer):
         self.repetition_penalty = args.repetition_penalty
         self.use_transformers_paged = args.use_transformers_paged
         self.use_vllm = args.use_vllm
+        self.use_vllm_eval = args.use_vllm_eval
         self.vllm_mode = args.vllm_mode
         self.vllm_gpu_memory_utilization = args.vllm_gpu_memory_utilization  # only applies to colocation mode
         self.vllm_tensor_parallel_size = args.vllm_tensor_parallel_size  # only applies to colocation mode
         self.vllm_importance_sampling_correction = args.vllm_importance_sampling_correction
-        self.vllm_importance_sampling_mode = args.vllm_importance_sampling_mode
-        self.vllm_importance_sampling_cap = args.vllm_importance_sampling_cap
+        self.use_importance_sampling_correction = args.use_importance_sampling_correction
         self.use_liger_kernel = args.use_liger_kernel
         self.loss_type = args.loss_type
         self.scale_rewards = args.scale_rewards
         self.importance_sampling_level = args.importance_sampling_level
         self.mask_truncated_completions = args.mask_truncated_completions
         self.top_entropy_quantile = args.top_entropy_quantile
+        self.importance_sampling_mode = args.importance_sampling_mode
+        self.importance_sampling_cap = args.importance_sampling_cap
+        self.disable_importance_sampling_clipping = args.disable_importance_sampling_clipping
+        self.use_importance_sampling_shaping = args.use_importance_sampling_shaping
+        self.importance_sampling_shaping_gamma = args.importance_sampling_shaping_gamma
         if self.use_liger_kernel and self.top_entropy_quantile < 1.0:
             raise NotImplementedError(
                 "Liger Kernels don't currently support masking token positions based on entropy."
@@ -419,6 +528,113 @@ class GRPOTrainer(BaseTrainer):
                 "Liger Kernels currently only support token-level importance sampling. Please set"
                 "`importance_sampling_level` to 'token'."
             )
+
+        # Optional off-policy teacher used for logit fusion during rollout sampling
+        self.teacher_model = None
+        self.teacher_model_kwarg_keys = ()
+        self.logit_fusion_alpha = args.logit_fusion_alpha
+        self.logit_fusion_alpha_schedule = args.logit_fusion_alpha_schedule
+        self.logit_fusion_alpha_decay_steps = args.logit_fusion_alpha_decay_steps
+        self.use_fusion_importance_sampling = args.use_fusion_importance_sampling
+        if teacher_model is not None:
+            if self.use_vllm:
+                raise ValueError("Logit fusion with a teacher model is not supported when using vLLM generation.")
+            if self.use_transformers_paged:
+                raise ValueError(
+                    "Logit fusion with a teacher model is not supported when using transformers paged generation."
+                )
+            if not 0.0 <= self.logit_fusion_alpha <= 1.0:
+                raise ValueError("logit_fusion_alpha must be between 0.0 and 1.0 when using a teacher model.")
+
+            teacher_model_id = None
+            if isinstance(teacher_model, str):
+                teacher_model_id = teacher_model
+                teacher_model_kwargs = args.teacher_model_init_kwargs or {}
+                if not args.teacher_model_use_deepspeed:
+                    teacher_model_kwargs["device_map"] = None
+                if args.distributed_state.distributed_type == "DEEPSPEED":
+                    teacher_model_kwargs["device_map"] = None
+                teacher_model = create_model_from_path(teacher_model, **teacher_model_kwargs)
+            else:
+                if args.teacher_model_init_kwargs is not None:
+                    logger.warning(
+                        "You passed `teacher_model_init_kwargs` to `GRPOConfig`, but `teacher_model` is already "
+                        "instantiated. The `teacher_model_init_kwargs` will be ignored."
+                    )
+
+            if not isinstance(teacher_model, PreTrainedModel):
+                raise TypeError("The `teacher_model` must be either a string or an instance of `PreTrainedModel`.")
+
+            teacher_vocab_size = getattr(teacher_model.config, "vocab_size", None)
+            model_vocab_size = getattr(model.config, "vocab_size", None)
+            if teacher_vocab_size is not None and model_vocab_size is not None and teacher_vocab_size != model_vocab_size:
+                teacher_tokenizer_id = teacher_model_id or get_config_model_id(teacher_model.config)
+                teacher_tokenizer_kwargs = {}
+                if isinstance(args.teacher_model_init_kwargs, dict):
+                    trust_remote_code = args.teacher_model_init_kwargs.get("trust_remote_code")
+                    if trust_remote_code is not None:
+                        teacher_tokenizer_kwargs["trust_remote_code"] = trust_remote_code
+                try:
+                    teacher_tokenizer = AutoTokenizer.from_pretrained(
+                        teacher_tokenizer_id, **teacher_tokenizer_kwargs
+                    )
+                except Exception as exc:
+                    raise ValueError(
+                        "The teacher model vocab size {} does not match the policy model vocab size {} and the "
+                        "teacher tokenizer could not be loaded for a vocab check.".format(
+                            teacher_vocab_size, model_vocab_size
+                        )
+                    ) from exc
+                if tokenizer.get_vocab() != teacher_tokenizer.get_vocab():
+                    raise ValueError(
+                        "The teacher model vocab size {} does not match the policy model vocab size {}.".format(
+                            teacher_vocab_size, model_vocab_size
+                        )
+                    )
+                logger.warning(
+                    "Teacher model vocab size %s does not match policy vocab size %s, but tokenizers match. "
+                    "Continuing with logit fusion.",
+                    teacher_vocab_size,
+                    model_vocab_size,
+                )
+
+            if teacher_model.config.pad_token_id is None:
+                teacher_model.config.pad_token_id = self.pad_token_id
+            if teacher_model.config.eos_token_id is None:
+                teacher_model.config.eos_token_id = self.eos_token_id
+            if hasattr(teacher_model.config, "use_cache"):
+                teacher_model.config.use_cache = True
+
+            teacher_model.eval()
+            for param in teacher_model.parameters():
+                param.requires_grad_(False)
+
+            self.teacher_model_kwarg_keys = (
+                inspect.signature(teacher_model.forward).parameters.keys()
+                if not hasattr(teacher_model, "get_base_model")
+                else inspect.signature(teacher_model.get_base_model().forward).parameters.keys()
+            )
+            self.teacher_model = teacher_model
+            teacher_eos = self.teacher_model.config.eos_token_id
+            if teacher_eos is not None:
+                teacher_eos = [teacher_eos] if isinstance(teacher_eos, int) else list(teacher_eos)
+                self.eos_token_ids = list(dict.fromkeys(self.eos_token_ids + teacher_eos))
+        elif self.logit_fusion_alpha is not None:
+            logger.warning(
+                "logit_fusion_alpha is set but no teacher_model was provided. Logit fusion will be disabled."
+            )
+        if teacher_model is None and self.logit_fusion_alpha_schedule is not None:
+            logger.warning(
+                "logit_fusion_alpha_schedule is set but no teacher_model was provided. Alpha decay will be disabled."
+            )
+            self.logit_fusion_alpha_schedule = None
+        self._logit_fusion_alpha_start = self.logit_fusion_alpha
+        if self.use_fusion_importance_sampling and teacher_model is None:
+            logger.warning(
+                "use_fusion_importance_sampling is enabled but no teacher_model was provided. "
+                "Fusion importance sampling will be disabled."
+            )
+            self.use_fusion_importance_sampling = False
 
         # Datasets
         self.shuffle_dataset = args.shuffle_dataset
@@ -444,6 +660,9 @@ class GRPOTrainer(BaseTrainer):
         self.num_iterations = args.num_iterations  # = 𝜇 in the GRPO paper
         self.epsilon_low = args.epsilon
         self.epsilon_high = args.epsilon_high if args.epsilon_high is not None else args.epsilon
+        self.use_max_value_clipping = args.use_max_value_clipping
+        self.use_difficulty_alpha_scales = args.use_difficulty_alpha_scales
+        self.logit_fusion_is_ratio_clip_max = args.logit_fusion_is_ratio_clip_max
         # Tracks the number of iterations (forward + backward passes), including those within a grad accum cycle
         self._step = 0
         # Buffer the batch to reuse generated outputs across multiple updates. For more details, see
@@ -497,6 +716,8 @@ class GRPOTrainer(BaseTrainer):
             disable_dropout_in_model(model)
             if self.ref_model is not None:
                 disable_dropout_in_model(self.ref_model)
+            if self.teacher_model is not None:
+                disable_dropout_in_model(self.teacher_model)
 
         # Cast LM Head To FP32
         if args.cast_lm_head_to_fp32:
@@ -566,11 +787,10 @@ class GRPOTrainer(BaseTrainer):
         # it's safer to set it in all cases.
         set_seed(args.seed, device_specific=True)
 
-        if self.use_vllm:
+        if self.use_vllm or self.use_vllm_eval:
             if not is_vllm_available():
                 raise ImportError(
-                    "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
-                    "`pip install trl[vllm]` to use it."
+                    "vLLM is required for evaluation. Please install vLLM with `pip install trl[vllm]`."
                 )
 
             if self.vllm_mode == "server":
@@ -654,13 +874,20 @@ class GRPOTrainer(BaseTrainer):
             # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
             # synchronize all processes after vLLM has been fully initialized.
             self.accelerator.wait_for_everyone()
-        else:
+
+        if not self.use_vllm:
             generation_kwargs = {
                 "max_new_tokens": self.max_completion_length,
                 "do_sample": True,
                 "pad_token_id": tokenizer.pad_token_id,
                 "bos_token_id": tokenizer.bos_token_id,
-                "eos_token_id": tokenizer.eos_token_id,
+                "eos_token_id": (
+                    self.eos_token_ids[0]
+                    if len(self.eos_token_ids) == 1
+                    else self.eos_token_ids
+                    if self.eos_token_ids
+                    else tokenizer.eos_token_id
+                ),
                 "temperature": self.temperature,
                 "top_p": self.top_p,
                 "top_k": self.top_k,
@@ -688,6 +915,27 @@ class GRPOTrainer(BaseTrainer):
             else:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
+        if self.teacher_model is not None:
+            if self.is_deepspeed_enabled and self.args.teacher_model_use_deepspeed:
+                self.teacher_model = prepare_deepspeed(self.teacher_model, self.accelerator)
+            elif self.is_fsdp_enabled and self.args.teacher_model_use_deepspeed:
+                self.teacher_model = prepare_fsdp(self.teacher_model, self.accelerator)
+            elif self.args.teacher_model_use_deepspeed:
+                self.teacher_model = self.accelerator.prepare_model(
+                    self.teacher_model, evaluation_mode=True, device_placement=True
+                )
+            else:
+                device = self.accelerator.device
+                if self.args.bf16:
+                    self.teacher_model = self.teacher_model.to(device=device, dtype=torch.bfloat16)
+                elif self.args.fp16:
+                    self.teacher_model = self.teacher_model.to(device=device, dtype=torch.float16)
+                else:
+                    self.teacher_model = self.teacher_model.to(device=device)
+            self.teacher_model.eval()
+            for param in self.teacher_model.parameters():
+                param.requires_grad_(False)
+
         if args.sync_ref_model:
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
 
@@ -700,6 +948,51 @@ class GRPOTrainer(BaseTrainer):
                     self.reward_funcs[i] = self.accelerator.prepare_model(
                         reward_func, evaluation_mode=True, device_placement=True
                     )
+
+    def _get_logit_fusion_alpha(self) -> float | None:
+        if self.teacher_model is None or self.logit_fusion_alpha is None:
+            return self.logit_fusion_alpha
+        if self.logit_fusion_alpha_schedule is None:
+            return self.logit_fusion_alpha
+
+        decay_steps = self.logit_fusion_alpha_decay_steps
+        progress = min(self.state.global_step, decay_steps) / float(decay_steps)
+        start_alpha = self._logit_fusion_alpha_start
+        final_alpha = 0.0
+
+        if self.logit_fusion_alpha_schedule == "linear":
+            alpha = start_alpha + (final_alpha - start_alpha) * progress
+        else:
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            alpha = final_alpha + (start_alpha - final_alpha) * cosine
+
+        return float(min(max(alpha, 0.0), 1.0))
+
+    def _get_difficulty_alpha_scales(self, inputs: list[dict[str, torch.Tensor | Any]]) -> torch.Tensor | None:
+        if not self.use_difficulty_alpha_scales or not inputs or "difficulty" not in inputs[0]:
+            return None
+        difficulty_values = []
+        for example in inputs:
+            value = example.get("difficulty")
+            if value is None:
+                return None
+            try:
+                difficulty_values.append(float(value))
+            except (TypeError, ValueError):
+                return None
+        difficulty_tensor = torch.tensor(difficulty_values, device=self.accelerator.device, dtype=torch.float32)
+        return ((difficulty_tensor - 1.0) / 9.0).clamp(0.0, 1.0)
+
+    def _in_logit_fusion_decay_phase(self) -> bool:
+        if (
+            self.teacher_model is None
+            or self.logit_fusion_alpha is None
+            or self.logit_fusion_alpha_schedule is None
+            or self.state.global_step >= self.logit_fusion_alpha_decay_steps
+        ):
+            return False
+        alpha = self._get_logit_fusion_alpha()
+        return alpha is not None and alpha > 0.0
 
     def _set_signature_columns_if_needed(self):
         # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
@@ -740,6 +1033,7 @@ class GRPOTrainer(BaseTrainer):
 
         if not isinstance(train_dataset, torch.utils.data.IterableDataset):
             dataloader_params["sampler"] = self._get_train_sampler()
+            print("len of sampler:", dataloader_params["sampler"].__len__())
             dataloader_params["drop_last"] = self.args.dataloader_drop_last
             dataloader_params["worker_init_fn"] = partial(
                 seed_worker, num_workers=self.args.dataloader_num_workers, rank=self.args.process_index
@@ -757,23 +1051,6 @@ class GRPOTrainer(BaseTrainer):
         #    in group formation.
         # 2. repeats the batch multiple times to allow reusing generations across multiple updates. Refer to
         #    _prepare_inputs to see how the generations are stored and reused.
-
-        # In the following figure, the values are the prompt indices. The first row shows the first sampled batch, the
-        # second row shows the second sampled batch, and so on.
-        #
-        #                                      |   GPU 0  |   GPU 1  |
-        #
-        #                 global_step   step    <-───>  num_generations=2
-        #                                       <-───────> per_device_train_batch_size=3
-        #  grad_accum    ▲  ▲  0          0     0   0   1   1   2   2   <- Generate for the first `steps_per_generation` (prompts 0 to 11); store the completions; use the first slice to compute the loss
-        #     =2         ▼  |  0          1     3   3   4   4   5   5   <- Take the stored generations and use the second slice to compute the loss
-        #                   |
-        #                   |  1          2     6   6   7   7   8   8   <- Take the stored generations and use the third slice to compute the loss
-        #  steps_per_gen=4  ▼  1          3     9   9  10  10  11  11   <- Take the stored generations and use the fourth slice to compute the loss
-        #
-        #                      2          4    12  12  13  13  14  14   <- Generate for the second `steps_per_generation` (prompts 12 to 23); store the completions; use the first slice to compute the loss
-        #                      2          5    15  15  16  16  17  17   <- Take the stored generations and use the second slice to compute the loss
-        #                                          ...
         if dataset is None:
             dataset = self.train_dataset
         return RepeatSampler(
@@ -948,6 +1225,123 @@ class GRPOTrainer(BaseTrainer):
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         return logps, entropies
+
+    def _get_fused_per_token_logps(
+        self,
+        input_ids,
+        attention_mask,
+        logits_to_keep,
+        batch_size=None,
+        alpha_scales=None,
+        pixel_values=None,
+        image_grid_thw=None,
+        num_images=None,
+        pixel_attention_mask=None,
+        image_sizes=None,
+        token_type_ids=None,
+    ) -> torch.Tensor:
+        """Compute per-token log-probs from fused logits (teacher + policy) for completion tokens."""
+        if self.teacher_model is None:
+            raise ValueError("Fusion logps requested but no teacher model is available.")
+
+        batch_size = batch_size or input_ids.size(0)
+        all_logps = []
+        for start in range(0, input_ids.size(0), batch_size):
+            input_ids_batch = input_ids[start : start + batch_size]
+            attention_mask_batch = attention_mask[start : start + batch_size]
+            alpha_scale_batch = None
+            if alpha_scales is not None:
+                alpha_scale_batch = alpha_scales[start : start + batch_size]
+
+            model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
+            if image_grid_thw is not None and pixel_values is not None:
+                rows_per_image = image_grid_thw.prod(dim=-1)
+                rows_per_sample = torch.split(rows_per_image, num_images)
+                rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
+                cum_rows = torch.cat([torch.tensor([0], device=rows_per_sample.device), rows_per_sample.cumsum(0)])
+                row_start, row_end = cum_rows[start].item(), cum_rows[start + batch_size].item()
+                model_inputs["pixel_values"] = pixel_values[row_start:row_end]
+                cum_imgs = torch.tensor([0] + num_images).cumsum(0)
+                img_start, img_end = cum_imgs[start], cum_imgs[start + batch_size]
+                model_inputs["image_grid_thw"] = image_grid_thw[img_start:img_end]
+            elif pixel_values is not None:
+                model_inputs["pixel_values"] = pixel_values[start : start + batch_size]
+            if pixel_attention_mask is not None:
+                model_inputs["pixel_attention_mask"] = pixel_attention_mask[start : start + batch_size]
+            if image_sizes is not None:
+                model_inputs["image_sizes"] = image_sizes[start : start + batch_size]
+            if token_type_ids is not None:
+                model_inputs["token_type_ids"] = token_type_ids[start : start + batch_size]
+
+            if "logits_to_keep" in self.model_kwarg_keys and "logits_to_keep" in self.teacher_model_kwarg_keys:
+                model_inputs["logits_to_keep"] = logits_to_keep + 1
+
+            model_inputs["use_cache"] = False
+
+            alpha = self._get_logit_fusion_alpha()
+            teacher_gather = self.args.ds3_gather_for_generation
+            if (
+                self.is_deepspeed_enabled
+                and self.args.teacher_model_use_deepspeed
+                and not teacher_gather
+            ):
+                logger.warning(
+                    "Overriding ds3_gather_for_generation to True for the teacher model to avoid sharded "
+                    "embedding errors during logit fusion.",
+                )
+                teacher_gather = True
+            with (
+                unwrap_model_for_generation(
+                    self.model_wrapped,
+                    self.accelerator,
+                    gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                )
+                if self.is_deepspeed_enabled or self.is_fsdp_enabled
+                else nullcontext(self.model)
+            ) as unwrapped_policy, (
+                unwrap_model_for_generation(
+                    self.teacher_model,
+                    self.accelerator,
+                    gather_deepspeed3_params=teacher_gather,
+                )
+                if self.teacher_model is not None and (self.is_deepspeed_enabled or self.is_fsdp_enabled)
+                else nullcontext(self.teacher_model)
+            ) as unwrapped_teacher:
+                policy_logits = unwrapped_policy(**model_inputs).logits
+                if alpha is None or alpha <= 0.0:
+                    logits = policy_logits
+                else:
+                    alpha_tensor = None
+                    if alpha_scale_batch is not None:
+                        alpha_tensor = alpha_scale_batch.to(dtype=policy_logits.dtype, device=policy_logits.device)
+                        alpha_tensor = (alpha_tensor * float(alpha)).clamp(0.0, 1.0)
+                    if alpha_tensor is None or torch.any(alpha_tensor > 0.0):
+                        teacher_logits = unwrapped_teacher(**model_inputs).logits
+                        if teacher_logits.size(-1) != policy_logits.size(-1):
+                            if teacher_logits.size(-1) < policy_logits.size(-1):
+                                raise ValueError(
+                                    "Teacher logits vocab size {} is smaller than policy logits vocab size {}.".format(
+                                        teacher_logits.size(-1), policy_logits.size(-1)
+                                    )
+                                )
+                            teacher_logits = teacher_logits[..., : policy_logits.size(-1)]
+                        teacher_logits = teacher_logits.to(dtype=policy_logits.dtype, device=policy_logits.device)
+                        if alpha_tensor is None:
+                            logits = alpha * teacher_logits + (1 - alpha) * policy_logits
+                        else:
+                            alpha_tensor = alpha_tensor.view(-1, 1, 1)
+                            logits = alpha_tensor * teacher_logits + (1 - alpha_tensor) * policy_logits
+                    else:
+                        logits = policy_logits
+
+            logits = logits[:, :-1, :]
+            logits = logits[:, -logits_to_keep:, :]
+            logits = logits / self.temperature
+            completion_ids = input_ids_batch[:, -logits_to_keep:]
+            logps = selective_log_softmax(logits, completion_ids)
+            all_logps.append(logps)
+
+        return torch.cat(all_logps, dim=0)
 
     def _fix_param_name_to_vllm(self, name, extra_prefixes: list[str] | None = None):
         extra_prefixes = extra_prefixes or []
@@ -1184,12 +1578,13 @@ class GRPOTrainer(BaseTrainer):
         rewards_per_func = gather(rewards_per_func)
         return rewards_per_func
 
-    def _generate_single_turn(self, prompts: list):
+    def _generate_single_turn(self, prompts: list, alpha_scales: torch.Tensor | None = None):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
 
         # Generate completions using either vLLM or regular generation
-        if self.use_vllm:
+        use_vllm = self.use_vllm if mode == "train" else self.use_vllm_eval
+        if use_vllm:
             if self.vllm_mode == "colocate" and self.args.vllm_enable_sleep_mode:
                 # wake up colocated vLLM instances if needed
                 torch.cuda.empty_cache()  # required to avoid OOM in some cases
@@ -1386,7 +1781,9 @@ class GRPOTrainer(BaseTrainer):
             with (
                 profiling_context(self, "transformers.generate_batch"),
                 unwrap_model_for_generation(
-                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                    self.model_wrapped,
+                    self.accelerator,
+                    gather_deepspeed3_params=self.args.ds3_gather_for_generation,
                 ) as unwrapped_model,
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
@@ -1432,16 +1829,46 @@ class GRPOTrainer(BaseTrainer):
                 generate_inputs = self.processing_class(text=prompts, **processor_kwargs)
             generate_inputs = super()._prepare_inputs(generate_inputs)
 
+            fusion_enabled = self.teacher_model is not None and self.model.training
             with (
                 profiling_context(self, "transformers.generate"),
                 unwrap_model_for_generation(
-                    self.model_wrapped, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                    self.model_wrapped,
+                    self.accelerator,
+                    gather_deepspeed3_params=self.args.ds3_gather_for_generation,
                 ) as unwrapped_model,
+                (
+                    unwrap_model_for_generation(
+                        self.teacher_model,
+                        self.accelerator,
+                        gather_deepspeed3_params=self.args.ds3_gather_for_generation,
+                    )
+                    if fusion_enabled
+                    else nullcontext(self.teacher_model)
+                ) as unwrapped_teacher,
                 torch.no_grad(),
                 FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
             ):
+                logits_processor = None
+                if fusion_enabled:
+                    alpha = self._get_logit_fusion_alpha()
+                    if alpha is not None and alpha > 0.0:
+                        logits_processor = LogitsProcessorList(
+                            [
+                                LogitsFusionProcessor(
+                                    unwrapped_teacher,
+                                    alpha,
+                                    self.pad_token_id,
+                                    "use_cache" in self.teacher_model_kwarg_keys,
+                                    alpha_scales=alpha_scales,
+                                )
+                            ]
+                        )
                 prompt_completion_ids = unwrapped_model.generate(
-                    **generate_inputs, generation_config=self.generation_config, disable_compile=True
+                    **generate_inputs,
+                    generation_config=self.generation_config,
+                    disable_compile=True,
+                    logits_processor=logits_processor,
                 )
             # Compute prompt length and extract completion ids
             prompt_ids, prompt_mask = generate_inputs["input_ids"], generate_inputs["attention_mask"]
@@ -1449,23 +1876,31 @@ class GRPOTrainer(BaseTrainer):
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
             # Mask everything after the first EOS token
-            is_eos = completion_ids == self.eos_token_id
+            if self.eos_token_ids:
+                eos_token_ids = torch.tensor(self.eos_token_ids, device=device)
+                is_eos = completion_ids.unsqueeze(-1).eq(eos_token_ids).any(dim=-1)
+            else:
+                is_eos = torch.zeros_like(completion_ids, dtype=torch.bool)
             eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
             sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
             completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+            logprobs = None  # not used in this case
             prompt_ids = [p[m].tolist() for p, m in zip(prompt_ids, prompt_mask.bool(), strict=True)]
             completion_ids = [c[m].tolist() for c, m in zip(completion_ids, completion_mask.bool(), strict=True)]
-            logprobs = None  # not used in this case
             extra_fields = {}  # No extra fields for non-rollout_func paths
 
         return prompt_ids, completion_ids, logprobs, extra_fields
 
-    def _generate(self, prompts: list):
+    def _generate(self, prompts: list, alpha_scales: torch.Tensor | None = None):
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
+        if mode == "eval" and not self.use_vllm_eval:
+            raise ValueError("Evaluation is configured to require vLLM generation.")
 
-        prompt_ids, completion_ids, logprobs, extra_fields = self._generate_single_turn(prompts)
+        prompt_ids, completion_ids, logprobs, extra_fields = self._generate_single_turn(
+            prompts, alpha_scales=alpha_scales
+        )
 
         # Get completion length per sequence, used for logging
         prompt_lengths = torch.tensor([len(ids) for ids in prompt_ids], device=device)
@@ -1486,7 +1921,7 @@ class GRPOTrainer(BaseTrainer):
         self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
         # Identify sequences that terminated with EOS and log their lengths
-        eos_and_pad = [self.eos_token_id, self.pad_token_id]
+        eos_and_pad = list(dict.fromkeys(self.eos_token_ids + [self.pad_token_id]))
         is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
         agg_is_truncated = self.accelerator.gather(is_truncated)
         self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
@@ -1506,6 +1941,7 @@ class GRPOTrainer(BaseTrainer):
         mode = "train" if self.model.training else "eval"
 
         prompts = [x["prompt"] for x in inputs]
+        difficulty_alpha_scales = self._get_difficulty_alpha_scales(inputs)
 
         if "images" in inputs[0]:
             images = [example.get("images") for example in inputs]
@@ -1527,8 +1963,10 @@ class GRPOTrainer(BaseTrainer):
             ]
 
         prompt_ids_list, completion_ids_list, num_items_in_batch, sampling_per_token_logps_list, extra_fields = (
-            self._generate(prompts)
+            self._generate(prompts, alpha_scales=difficulty_alpha_scales)
         )
+        if mode == "eval":
+            sampling_per_token_logps_list = None
 
         # Convert lists of token IDs to padded tensors
         prompt_ids = [torch.tensor(ids, device=device) for ids in prompt_ids_list]
@@ -1547,7 +1985,7 @@ class GRPOTrainer(BaseTrainer):
 
         # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.mask_truncated_completions:
-            eos_and_pad = [self.eos_token_id, self.pad_token_id]
+            eos_and_pad = list(dict.fromkeys(self.eos_token_ids + [self.pad_token_id]))
             is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
             completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
 
@@ -1580,75 +2018,88 @@ class GRPOTrainer(BaseTrainer):
             )
 
         with torch.no_grad():
-            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-            # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-            # old_per_token_logps to None.
-            # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
-            # distribution mismatch between vLLM and the training model can be large and harm the training.
-            generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction
-            ):
-                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    num_images=num_images,
-                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
-                )
-            else:
-                old_per_token_logps = None
-
-            # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
-            if self.use_vllm and self.vllm_importance_sampling_correction:
-                per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * completion_mask
-
-                sequence_level_is = self.vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
-                if sequence_level_is:
-                    per_sequence_logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
-                    logps_diff = per_sequence_logps_diff
-                else:
-                    logps_diff = per_token_logps_diff
-
-                vllm_importance_sampling_ratio = torch.exp(logps_diff)
-
-                # vllm_importance_sampling_ratio.shape:
-                #   token_* modes:     (B, T)  (per-token ratio)
-                #   sequence_* modes:  (B, 1)  (per-sequence ratio)
-
-                if self.vllm_importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
-                    vllm_importance_sampling_ratio = torch.clamp(
-                        vllm_importance_sampling_ratio, max=self.vllm_importance_sampling_cap
-                    )
-                elif self.vllm_importance_sampling_mode in ["sequence_mask", "token_mask"]:
-                    vllm_importance_sampling_ratio = vllm_importance_sampling_ratio.masked_fill(
-                        vllm_importance_sampling_ratio > self.vllm_importance_sampling_cap, value=0.0
-                    )
-                else:
-                    raise ValueError(
-                        f"Unknown vLLM importance sampling level: {self.vllm_importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
-                    )
-
-            # Compute the per-token log probabilities for the reference model
-            if self.beta != 0.0:
-                if self.ref_model is not None:
-                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                        self.ref_model,
+            if mode == "train":
+                # Sampling (behavior) policy: teacher + student fused logits when available.
+                # Old policy: stale student. Training policy logps are computed later in _compute_loss.
+                behavior_per_token_logps = None
+                use_teacher = self.teacher_model is not None
+                if self.use_fusion_importance_sampling and use_teacher:
+                    behavior_per_token_logps = self._get_fused_per_token_logps(
                         prompt_completion_ids,
                         attention_mask,
                         logits_to_keep,
-                        batch_size=batch_size,
+                        batch_size,
+                        alpha_scales=difficulty_alpha_scales,
                         num_images=num_images,
                         **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
                     )
+                    if sampling_per_token_logps is None:
+                        sampling_per_token_logps = behavior_per_token_logps
+                elif sampling_per_token_logps is None and use_teacher:
+                    sampling_per_token_logps = self._get_fused_per_token_logps(
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size,
+                        alpha_scales=difficulty_alpha_scales,
+                        num_images=num_images,
+                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                    )
+
+                if behavior_per_token_logps is not None:
+                    old_per_token_logps = behavior_per_token_logps
                 else:
-                    with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size,
+                        num_images=num_images,
+                        **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                    )
+
+                use_importance_sampling_correction = (
+                    self.use_importance_sampling_correction and use_teacher and sampling_per_token_logps is not None
+                )
+
+                # Compute the importance sampling ratio to correct for distribution mismatch between behavior and old policy.
+                if use_importance_sampling_correction:
+                    per_token_logps_diff = (old_per_token_logps - sampling_per_token_logps) * completion_mask
+
+                    sequence_level_is = self.importance_sampling_mode in ["sequence_mask", "sequence_truncate"]
+                    if sequence_level_is:
+                        per_sequence_logps_diff = per_token_logps_diff.sum(dim=-1, keepdim=True)
+                        logps_diff = per_sequence_logps_diff
+                    else:
+                        logps_diff = per_token_logps_diff
+
+                    importance_sampling_ratio = torch.exp(logps_diff)
+
+                    # importance_sampling_ratio.shape:
+                    #   token_* modes:     (B, T)  (per-token ratio)
+                    #   sequence_* modes:  (B, 1)  (per-sequence ratio)
+
+                    if self.importance_sampling_mode in ["sequence_truncate", "token_truncate"]:
+                        importance_sampling_ratio = torch.clamp(
+                            importance_sampling_ratio, max=self.importance_sampling_cap
+                        )
+                    elif self.importance_sampling_mode in ["sequence_mask", "token_mask"]:
+                        importance_sampling_ratio = importance_sampling_ratio.masked_fill(
+                            importance_sampling_ratio > self.importance_sampling_cap, value=0.0
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unknown importance sampling level: {self.importance_sampling_mode}. Possible values are 'token_truncate', 'token_mask', 'sequence_truncate', and 'sequence_mask'."
+                        )
+                else:
+                    importance_sampling_ratio = None
+
+                # Compute the per-token log probabilities for the reference model
+                if self.beta != 0.0:
+                    if self.ref_model is not None:
                         ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
+                            self.ref_model,
                             prompt_completion_ids,
                             attention_mask,
                             logits_to_keep,
@@ -1656,8 +2107,24 @@ class GRPOTrainer(BaseTrainer):
                             num_images=num_images,
                             **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
                         )
+                    else:
+                        with self.accelerator.unwrap_model(self.model).disable_adapter():
+                            ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                                self.model,
+                                prompt_completion_ids,
+                                attention_mask,
+                                logits_to_keep,
+                                batch_size=batch_size,
+                                num_images=num_images,
+                                **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                            )
+                else:
+                    ref_per_token_logps = None
             else:
+                old_per_token_logps = None
                 ref_per_token_logps = None
+                use_importance_sampling_correction = False
+                importance_sampling_ratio = None
 
         # Decode
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
@@ -1742,7 +2209,7 @@ class GRPOTrainer(BaseTrainer):
         if images is not None:
             self._logs["images"].extend(gather_object(images))
 
-        if self.use_vllm and self.vllm_importance_sampling_correction:
+        if use_importance_sampling_correction:
             delta = torch.abs(old_per_token_logps - sampling_per_token_logps)
             delta = delta[completion_mask.bool()]
             mean_delta = torch.mean(delta) if delta.numel() > 0 else torch.tensor(0.0, device=device)
@@ -1755,9 +2222,9 @@ class GRPOTrainer(BaseTrainer):
             )
 
             if sequence_level_is:
-                flat_is_ratio = vllm_importance_sampling_ratio.flatten()
+                flat_is_ratio = importance_sampling_ratio.flatten()
             else:
-                flat_is_ratio = vllm_importance_sampling_ratio[completion_mask.bool()]
+                flat_is_ratio = importance_sampling_ratio[completion_mask.bool()]
 
             min_importance_sampling_ratio = (
                 torch.min(flat_is_ratio) if flat_is_ratio.numel() > 0 else torch.tensor(0.0, device=device)
@@ -1788,8 +2255,8 @@ class GRPOTrainer(BaseTrainer):
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
-        if self.use_vllm and self.vllm_importance_sampling_correction:
-            output["importance_sampling_ratio"] = vllm_importance_sampling_ratio
+        if use_importance_sampling_correction:
+            output["importance_sampling_ratio"] = importance_sampling_ratio
         if ref_per_token_logps is not None:
             output["ref_per_token_logps"] = ref_per_token_logps
         if "pixel_values" in forward_kwargs:
@@ -1907,11 +2374,8 @@ class GRPOTrainer(BaseTrainer):
         # provide advantages with shape (B, T) (e.g., MiniLLM), we *conditionally* unsqueeze the tensor.
         if advantages.dim() == 1:
             advantages = advantages.unsqueeze(1)
-        # When num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps,
-        # old_per_token_logps == per_token_logps. In this case we can skip its computation
-        # (see _generate_and_score_completions) and instead use per_token_logps.detach().
-        # The exception is when using vLLM, where we always compute old_per_token_logps
-        # for importance sampling
+        # old_per_token_logps comes from the stale student policy at rollout time.
+        # If it's not provided, fall back to the current policy logps.
         old_per_token_logps = inputs.get("old_per_token_logps")
         old_per_token_logps = per_token_logps.detach() if old_per_token_logps is None else old_per_token_logps
 
@@ -1928,21 +2392,41 @@ class GRPOTrainer(BaseTrainer):
             )
 
         coef_1 = torch.exp(log_importance_weights)
+        if self.use_importance_sampling_shaping and self._in_logit_fusion_decay_phase():
+            coef_1 = coef_1 / (coef_1 + self.importance_sampling_shaping_gamma)
+
+        use_max_value_clipping = self.use_max_value_clipping and self._in_logit_fusion_decay_phase()
+        disable_clipping = self.disable_importance_sampling_clipping and self._in_logit_fusion_decay_phase()
+        epsilon_low = self.epsilon_low
+        epsilon_high = self.epsilon_high
+        max_is_ratio = self.logit_fusion_is_ratio_clip_max
 
         # From here, log_importance_weights (and all subsequent tensors, coef_1, coef_2, etc.) shape depends on
         # importance_sampling_level: "token" level: (B, T); "sequence" level: (B, 1)
         if self.loss_type == "cispo":
-            clamped_ratios = torch.clamp(coef_1, max=self.epsilon_high).detach()
+            if disable_clipping:
+                clamped_ratios = coef_1.detach()
+            else:
+                clamped_ratios = torch.clamp(coef_1, max=epsilon_high).detach()
             per_token_loss = -clamped_ratios * advantages * per_token_logps
         elif self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
-            coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
+            if disable_clipping:
+                coef_2 = coef_1
+            else:
+                if use_max_value_clipping:
+                    coef_2 = torch.clamp(coef_1, max=max_is_ratio)
+                else:
+                    coef_2 = torch.clamp(coef_1, 1 - epsilon_low, 1 + epsilon_high)
             # Two-sided clipping
             if self.args.delta is not None:
                 coef_1 = torch.clamp(coef_1, max=self.args.delta)
 
-            per_token_loss1 = coef_1 * advantages
-            per_token_loss2 = coef_2 * advantages
-            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+            if disable_clipping or use_max_value_clipping:
+                per_token_loss = -(coef_2 * advantages)
+            else:
+                per_token_loss1 = coef_1 * advantages
+                per_token_loss2 = coef_2 * advantages
+                per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         elif self.loss_type == "sapo":
             per_token_loss = torch.empty_like(coef_1)
             positive_advantages_mask = advantages.repeat([1, coef_1.shape[1]]) > 0
@@ -1959,7 +2443,8 @@ class GRPOTrainer(BaseTrainer):
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
 
-        if self.use_vllm and self.vllm_importance_sampling_correction:
+        use_importance_sampling_correction = inputs.get("importance_sampling_ratio") is not None
+        if use_importance_sampling_correction:
             per_token_loss = per_token_loss * inputs["importance_sampling_ratio"]
 
         if self.beta != 0.0:
@@ -1998,10 +2483,14 @@ class GRPOTrainer(BaseTrainer):
         mean_entropy = masked_batch_mean(entropies)
         self._metrics[mode]["entropy"].append(self.accelerator.gather(mean_entropy).nanmean().item())
 
-        if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"]:
+        if self.loss_type in ["grpo", "bnpo", "dr_grpo", "dapo"] and not disable_clipping:
             # Compute the clipped probability ratios
-            is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
-            is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
+            if use_max_value_clipping:
+                is_low_clipped = torch.zeros_like(coef_1, dtype=torch.bool)
+                is_high_clipped = coef_1 > max_is_ratio
+            else:
+                is_low_clipped = (coef_1 < 1 - epsilon_low) & (advantages < 0)
+                is_high_clipped = (coef_1 > 1 + epsilon_high) & (advantages > 0)
             is_region_clipped = is_low_clipped | is_high_clipped
 
             low_clip = masked_batch_mean(is_low_clipped.float())
@@ -2017,7 +2506,7 @@ class GRPOTrainer(BaseTrainer):
             gathered_clip_ratio = self.accelerator.gather(clip_ratio)
             self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
         elif self.loss_type == "cispo":
-            is_cispo_clipped = (coef_1 > self.epsilon_high) & (advantages > 0)
+            is_cispo_clipped = (coef_1 > epsilon_high) & (advantages > 0)
             cispo_clip_ratio = masked_batch_mean(is_cispo_clipped.float())
             gathered_cispo_clip_ratio = self.accelerator.gather(cispo_clip_ratio)
             self._metrics[mode]["cispo_clip_ratio"].append(gathered_cispo_clip_ratio.nanmean().item())
@@ -2025,6 +2514,11 @@ class GRPOTrainer(BaseTrainer):
         return loss
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        if not self.model.training:
+            self._prepare_inputs(inputs)
+            loss = torch.tensor(0.0, device=self.accelerator.device)
+            return loss, None, None
+
         inputs = self._prepare_inputs(inputs)
         with torch.no_grad():
             with self.compute_loss_context_manager():
@@ -2059,8 +2553,8 @@ class GRPOTrainer(BaseTrainer):
             logging_backends = []
             if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                 logging_backends.append(wandb)
-            if self.args.report_to and "trackio" in self.args.report_to:
-                logging_backends.append(trackio)
+            # if self.args.report_to and "trackio" in self.args.report_to:
+            #     logging_backends.append(trackio)
 
             table = {
                 "step": [str(self.state.global_step)] * len(self._logs["prompt"]),

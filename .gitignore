@@ -143,3 +143,18 @@ checklink/cookies.txt
 nbs/wandb/
 examples/notebooks/wandb/
 wandb/
+# Project-specific local artifacts
+command.sh
+plot.ipynb
+outputs/
+trainer_output/
+tokenizer_alignment_report/
+checkpoints/
+logs/
+runs/
+slurm-*.out
+slurm-*.err
+
+# Experiment trackers and local caches
+wandb/
+

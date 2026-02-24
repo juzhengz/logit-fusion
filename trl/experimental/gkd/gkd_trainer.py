@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from datasets import Dataset
 from transformers import (
     AutoModelForCausalLM,
+    AutoTokenizer,
     BaseImageProcessor,
     DataCollator,
     FeatureExtractionMixin,
@@ -33,12 +34,12 @@ from transformers import (
 )
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalPrediction
-from transformers.utils import is_liger_kernel_available, is_peft_available
+from transformers.utils import is_liger_kernel_available, is_peft_available, logging
 
 from ...models import prepare_deepspeed
 from ...models.utils import unwrap_model_for_generation
 from ...trainer.sft_trainer import SFTTrainer
-from ...trainer.utils import DataCollatorForChatML, disable_dropout_in_model, empty_cache
+from ...trainer.utils import DataCollatorForChatML, disable_dropout_in_model, empty_cache, get_config_model_id, nanstd
 from .gkd_config import GKDConfig
 
 
@@ -47,6 +48,30 @@ if is_peft_available():
 
 if is_liger_kernel_available():
     from liger_kernel.chunked_loss import LigerFusedLinearJSDLoss
+
+
+logger = logging.get_logger(__name__)
+DEFAULT_REWARD_SOLUTION_KEYS = ("solution", "answer", "final_answer")
+
+
+def _extract_reward_solution(example: dict[str, Any], solution_keys: tuple[str, ...]) -> str | None:
+    for key in solution_keys:
+        solution = example.get(key)
+        if solution is not None:
+            return str(solution)
+    return None
+
+
+class _RewardCollatorWrapper:
+    def __init__(self, base_collator: DataCollator, solution_keys: tuple[str, ...]):
+        self.base_collator = base_collator
+        self.solution_keys = solution_keys
+
+    def __call__(self, examples: list[dict[str, Any]]) -> dict[str, Any]:
+        batch = self.base_collator(examples)
+        if "reward_solution" not in batch:
+            batch["reward_solution"] = [_extract_reward_solution(example, self.solution_keys) for example in examples]
+        return batch
 
 
 class GKDTrainer(SFTTrainer):
@@ -87,6 +112,12 @@ class GKDTrainer(SFTTrainer):
             wrapped with the specified PEFT adapter.
         formatting_func (`Callable`, *optional*):
             Function to format the dataset. Must take in an example and return an example.
+        reward_func (`Callable`, *optional*):
+            Reward function used to compute rewards for generated completions. If provided, rewards are logged during
+            training and evaluation.
+        reward_solution_keys (`tuple[str, ...]`, *optional*):
+            Keys to search in dataset examples for the ground-truth solution used by the reward function. Defaults to
+            ("solution", "answer", "final_answer").
     """
 
     _tag_names = ["trl", "gkd"]
@@ -125,6 +156,8 @@ class GKDTrainer(SFTTrainer):
         preprocess_logits_for_metrics: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None,
         peft_config: "PeftConfig | None" = None,
         formatting_func: Callable | None = None,
+        reward_func: Callable | None = None,
+        reward_solution_keys: tuple[str, ...] | None = None,
     ):
         # Ensure Trainer does not drop non-signature columns used by the collator (e.g., "prompts")
         args.remove_unused_columns = False
@@ -149,6 +182,10 @@ class GKDTrainer(SFTTrainer):
                 compiled=False,
             )
             self.use_liger_gkd_loss = True
+
+        reward_solution_keys = reward_solution_keys or DEFAULT_REWARD_SOLUTION_KEYS
+        if reward_func is not None:
+            data_collator = _RewardCollatorWrapper(data_collator, reward_solution_keys)
 
         super().__init__(
             model,
@@ -179,12 +216,47 @@ class GKDTrainer(SFTTrainer):
                 else getattr(torch, teacher_model_init_kwargs["dtype"])
             )
 
+        teacher_model_id = None
         if isinstance(teacher_model, str):
+            teacher_model_id = teacher_model
             teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **teacher_model_init_kwargs)
 
         # Disable dropout in the model
         if args.disable_dropout:
             disable_dropout_in_model(self.model)
+
+        teacher_vocab_size = getattr(teacher_model.config, "vocab_size", None)
+        model_vocab_size = getattr(self.model.config, "vocab_size", None)
+        if teacher_vocab_size is not None and model_vocab_size is not None and teacher_vocab_size != model_vocab_size:
+            if isinstance(processing_class, PreTrainedTokenizerBase):
+                teacher_tokenizer_id = teacher_model_id or get_config_model_id(teacher_model.config)
+                teacher_tokenizer_kwargs = {}
+                if isinstance(args.teacher_model_init_kwargs, dict):
+                    trust_remote_code = args.teacher_model_init_kwargs.get("trust_remote_code")
+                    if trust_remote_code is not None:
+                        teacher_tokenizer_kwargs["trust_remote_code"] = trust_remote_code
+                try:
+                    teacher_tokenizer = AutoTokenizer.from_pretrained(
+                        teacher_tokenizer_id, **teacher_tokenizer_kwargs
+                    )
+                except Exception as exc:
+                    raise ValueError(
+                        "The teacher model vocab size {} does not match the student model vocab size {} and the "
+                        "teacher tokenizer could not be loaded for a vocab check.".format(
+                            teacher_vocab_size, model_vocab_size
+                        )
+                    ) from exc
+                if processing_class.get_vocab() != teacher_tokenizer.get_vocab():
+                    raise ValueError(
+                        "The teacher model vocab size {} does not match the student model vocab size {}.".format(
+                            teacher_vocab_size, model_vocab_size
+                        )
+                    )
+            logger.warning(
+                "Teacher vocab size %s does not match student vocab size %s; extra teacher logits will be dropped.",
+                teacher_vocab_size,
+                model_vocab_size,
+            )
 
         if self.is_deepspeed_enabled:
             self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
@@ -195,6 +267,9 @@ class GKDTrainer(SFTTrainer):
         self.beta = args.beta
         self.temperature = args.temperature
         self.seq_kd = args.seq_kd
+        self.reward_func = reward_func
+        self.reward_func_name = reward_func.__name__ if reward_func is not None else None
+        self._warned_missing_reward_solution = False
 
         self.generation_config = GenerationConfig(
             max_new_tokens=args.max_new_tokens,
@@ -213,6 +288,68 @@ class GKDTrainer(SFTTrainer):
             and self.model.generation_config.eos_token_id is not None
         ):
             self.generation_config.eos_token_id = self.model.generation_config.eos_token_id
+
+    def _compute_reward_metrics(self, model, inputs, mode: str) -> None:
+        if self.reward_func is None:
+            return
+
+        solutions = inputs.get("reward_solution")
+        if solutions is None:
+            if not self._warned_missing_reward_solution:
+                logger.warning("Reward logging is enabled, but no reward solutions were found in the inputs.")
+                self._warned_missing_reward_solution = True
+            return
+
+        prompt_ids = inputs.get("prompts")
+        if prompt_ids is None:
+            return
+
+        was_training = model.training
+        model.eval()
+        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model, torch.no_grad():
+            generated_outputs = unwrapped_model.generate(
+                input_ids=prompt_ids,
+                attention_mask=inputs.get("prompt_attention_mask"),
+                generation_config=self.generation_config,
+                return_dict_in_generate=True,
+            )
+        if was_training:
+            model.train()
+
+        generated_tokens = generated_outputs.sequences
+        completion_ids = generated_tokens[:, prompt_ids.shape[1] :]
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        completions = [[{"role": "assistant", "content": text}] for text in completions_text]
+
+        valid_indices = [idx for idx, solution in enumerate(solutions) if solution is not None]
+        if not valid_indices:
+            return
+
+        valid_completions = [completions[idx] for idx in valid_indices]
+        valid_solutions = [str(solutions[idx]) for idx in valid_indices]
+        try:
+            rewards_list = self.reward_func(valid_completions, valid_solutions)
+        except Exception as exc:
+            logger.warning("Reward function %s failed: %s", self.reward_func_name, exc)
+            return
+
+        full_rewards = [float("nan")] * len(completions)
+        for idx, reward in zip(valid_indices, rewards_list, strict=True):
+            full_rewards[idx] = float("nan") if reward is None else float(reward)
+
+        reward_tensor = torch.tensor(full_rewards, device=prompt_ids.device, dtype=torch.float32)
+        gathered_rewards = self.accelerator.gather_for_metrics(reward_tensor)
+        non_nan = torch.sum(~torch.isnan(gathered_rewards)).item()
+        if non_nan == 0:
+            return
+
+        mean_reward = torch.nanmean(gathered_rewards).item()
+        std_reward = nanstd(gathered_rewards).item() if non_nan > 1 else 0.0
+        reward_key = f"rewards/{self.reward_func_name}/mean"
+        self._metrics[mode][reward_key].append(mean_reward)
+        self._metrics[mode][f"rewards/{self.reward_func_name}/std"].append(std_reward)
+        self._metrics[mode]["reward"].append(mean_reward)
+        self._metrics[mode]["reward_std"].append(std_reward)
 
     @staticmethod
     def generalized_jsd_loss(
@@ -337,16 +474,30 @@ class GKDTrainer(SFTTrainer):
             # heads
             student_head = unwrapped_student.get_output_embeddings()
             teacher_head = unwrapped_teacher.get_output_embeddings()
+            if teacher_head.weight.size(0) != student_head.weight.size(0):
+                if teacher_head.weight.size(0) < student_head.weight.size(0):
+                    raise ValueError(
+                        "Teacher vocab size {} is smaller than student vocab size {}.".format(
+                            teacher_head.weight.size(0), student_head.weight.size(0)
+                        )
+                    )
+                teacher_weight = teacher_head.weight[: student_head.weight.size(0)]
+                teacher_bias = (
+                    teacher_head.bias[: student_head.weight.size(0)] if getattr(teacher_head, "bias", None) else None
+                )
+            else:
+                teacher_weight = teacher_head.weight
+                teacher_bias = getattr(teacher_head, "bias", None)
 
             # liger fused jsd loss
             loss = self.liger_jsd_loss(
                 student_input=student_hidden,
                 student_weight=student_head.weight,
                 teacher_input=teacher_hidden,
-                teacher_weight=teacher_head.weight,
+                teacher_weight=teacher_weight,
                 true_labels=true_labels,
                 student_bias=getattr(student_head, "bias", None),
-                teacher_bias=getattr(teacher_head, "bias", None),
+                teacher_bias=teacher_bias,
             )
 
             # Release hidden states after loss computation
@@ -368,8 +519,17 @@ class GKDTrainer(SFTTrainer):
 
             # slice the logits for the generated tokens using the inputs["prompts"] lengths
             prompt_lengths = inputs["prompts"].shape[1]
-            shifted_student_logits = student_outputs.logits[:, prompt_lengths - 1 : -1, :]
-            shifted_teacher_logits = teacher_outputs.logits[:, prompt_lengths - 1 : -1, :]
+            shifted_student_logits = student_outputs.logits[:, prompt_lengths-1: -1, :]
+            teacher_logits = teacher_outputs.logits
+            if teacher_logits.size(-1) != shifted_student_logits.size(-1):
+                if teacher_logits.size(-1) < shifted_student_logits.size(-1):
+                    raise ValueError(
+                        "Teacher vocab size {} is smaller than student vocab size {}.".format(
+                            teacher_logits.size(-1), shifted_student_logits.size(-1)
+                        )
+                    )
+                teacher_logits = teacher_logits[..., :shifted_student_logits.size(-1)]
+            shifted_teacher_logits = teacher_logits[:, prompt_lengths-1: -1, :]
             shifted_labels = inputs["labels"][:, prompt_lengths:]
 
             # compute loss
@@ -420,15 +580,25 @@ class GKDTrainer(SFTTrainer):
         the original inputs.
         """
         if self.seq_kd:
-            with unwrap_model_for_generation(self.teacher_model, self.accelerator) as unwrapped_model:
+            use_student = random.random() <= self.lmbda
+            rollout_model = model if use_student else self.teacher_model
+            with (
+                unwrap_model_for_generation(
+                    rollout_model, self.accelerator
+                ) as unwrapped_model,
+                torch.no_grad(),
+            ):
                 new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
                     unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
                 )
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
             inputs["labels"] = new_labels
-        if random.random() <= self.lmbda:
-            with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
+        elif random.random() <= self.lmbda:
+            with (
+                unwrap_model_for_generation(model, self.accelerator) as unwrapped_model,
+                torch.no_grad(),
+            ):
                 new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
                     unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
                 )
@@ -437,4 +607,13 @@ class GKDTrainer(SFTTrainer):
             inputs["labels"] = new_labels
 
         loss = super().training_step(model, inputs, num_items_in_batch)
+        if self.reward_func is not None:
+            self._compute_reward_metrics(model, inputs, mode="train")
         return loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys: list[str] | None = None):
+        loss, logits, labels = super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+        if self.reward_func is not None:
+            prepared_inputs = self._prepare_inputs(inputs)
+            self._compute_reward_metrics(model, prepared_inputs, mode="eval")
+        return loss, logits, labels

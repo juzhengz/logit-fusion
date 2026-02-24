@@ -34,7 +34,7 @@ class GKDConfig(SFTConfig):
         lmbda (`float`, *optional*, defaults to `0.5`):
             Lambda parameter that controls the student data fraction (i.e., the proportion of on-policy
             student-generated outputs).
-        beta (`float`, *optional*, defaults to `0.5`):
+        beta (`float`, *optional*, defaults to `1.0`):
             Interpolation coefficient between `0.0` and `1.0` of the Generalized Jensen-Shannon Divergence loss. When
             beta is `0.0`, the loss is the KL divergence. When beta is `1.0`, the loss is the Inverse KL Divergence.
         max_new_tokens (`int`, *optional*, defaults to `128`):
@@ -66,7 +66,7 @@ class GKDConfig(SFTConfig):
         },
     )
     beta: float = field(
-        default=0.5,
+        default=1.0,
         metadata={
             "help": "Interpolation coefficient between `0.0` and `1.0` of the Generalized Jensen-Shannon Divergence "
             "loss. When beta is `0.0`, the loss is the KL divergence. When beta is `1.0`, the loss is the Inverse KL "

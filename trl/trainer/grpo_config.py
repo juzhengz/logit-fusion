@@ -163,6 +163,23 @@ class GRPOConfig(TrainingArguments):
             Number of iterations per batch (denoted as μ in the algorithm).
         epsilon (`float`, *optional*, defaults to `0.2`):
             Epsilon value for clipping.
+        teacher_model_name_or_path (`str`, *optional*):
+            Optional frozen off-policy teacher model used for logit fusion during rollouts. Must share the same
+            vocabulary as the policy model.
+        teacher_model_revision (`str`, *optional*):
+            Revision of the teacher model to use (branch, tag, or commit hash).
+        use_max_value_clipping (`bool`, *optional*, defaults to `False`):
+            Whether to use max-value IS ratio clipping during the logit-fusion alpha decay phase. When enabled, PPO
+            clipping is replaced by truncating IS ratios at `logit_fusion_is_ratio_clip_max` regardless of advantage
+            sign.
+        use_difficulty_alpha_scales (`bool`, *optional*, defaults to `False`):
+            Whether to scale logit-fusion alpha per sample using the `difficulty` field in inputs.
+        difficulty_tier (`str`, *optional*, defaults to `all`):
+            Difficulty filter for training data. Use 'all' for no filtering, a number N to keep difficulty == N or
+            N + 0.5, or a comparison like '< 4' or 'example["difficulty"] < 4'.
+        logit_fusion_is_ratio_clip_max (`float`, *optional*, defaults to `3.0`):
+            Max IS ratio used for logit-fusion decay phase clipping. During decay, PPO-style clipping is replaced by
+            truncating IS ratios at this value regardless of advantage sign.
         delta (`float`, *optional*):
             Enables the upper clipping bound in two-sided GRPO loss when set to a float. If `None` (default), standard
             GRPO clipping is used. Recommended to be greater than `1 + ε` when enabled. This method is introduced in
@@ -253,12 +270,16 @@ class GRPOConfig(TrainingArguments):
             instead.
 
             </Deprecated>
-        vllm_importance_sampling_correction (`bool`, *optional*, defaults to `True`):
+        use_importance_sampling_correction (`bool`, *optional*, defaults to `False`):
+            Whether to compute importance sampling ratios between the behavior policy and the old policy during
+            rollout scoring when a teacher model is present. Disable this for on-policy distillation setups where
+            the behavior policy matches the student policy.
+        vllm_importance_sampling_correction (`bool`, *optional*, defaults to `False`):
             Whether to apply Importance Sampling (IS) to correct for the mismatch between vLLM completion logprobs and
             recomputed training logprobs. If set to `False`, no IS is applied regardless of
-            `vllm_importance_sampling_mode`. When `True`, the selected mode determines how the IS ratios are computed
+            `importance_sampling_mode`. When `True`, the selected mode determines how the IS ratios are computed
             and constrained.
-        vllm_importance_sampling_mode (`str`, *optional*, defaults to `"sequence_mask"`):
+        importance_sampling_mode (`str`, *optional*, defaults to `"sequence_mask"`):
             Specifies how Importance Sampling is performed when `vllm_importance_sampling_correction=True`. Possible
             values are:
 
@@ -267,8 +288,8 @@ class GRPOConfig(TrainingArguments):
                 - `"sequence_truncate"`: Sequence-level truncated IS. A single sequence ratio is clipped from above at
                   C and applied to all tokens in the sequence.
                 - `"sequence_mask"`: Sequence-level masked IS. Sequences with ratios above C are masked out.
-        vllm_importance_sampling_cap (`float`, *optional*, defaults to `3.0`):
-            Importance sampling cap C used by `vllm_importance_sampling_mode`. For `*_truncate` modes, importance
+        importance_sampling_cap (`float`, *optional*, defaults to `3.0`):
+            Importance sampling cap C used by `importance_sampling_mode`. For `*_truncate` modes, importance
             ratios are clipped from above at C. For `*_mask` modes, ratios larger than C are set to zero.
 
         > Parameters that control the logging
@@ -295,7 +316,7 @@ class GRPOConfig(TrainingArguments):
             </Deprecated>
     """
 
-    _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs"]
+    _VALID_DICT_FIELDS = TrainingArguments._VALID_DICT_FIELDS + ["model_init_kwargs", "teacher_model_init_kwargs"]
 
     # Parameters whose default values are overridden from TrainingArguments
     learning_rate: float = field(
@@ -341,6 +362,65 @@ class GRPOConfig(TrainingArguments):
             "help": "Keyword arguments for `transformers.AutoModelForCausalLM.from_pretrained`, used when the `model` "
             "argument of the `GRPOTrainer` is provided as a string."
         },
+    )
+    teacher_model_init_kwargs: dict | str | None = field(
+        default=None,
+        metadata={
+            "help": "Keyword arguments for `transformers.AutoModelForCausalLM.from_pretrained`, used when the "
+            "`teacher_model` argument of the `GRPOTrainer` is provided as a string."
+        },
+    )
+    teacher_model_use_deepspeed: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to wrap the teacher model with DeepSpeed/FSDP when enabled. Disable to keep the teacher "
+            "as a plain inference model on the local device."
+        },
+    )
+    logit_fusion_alpha: float | None = field(
+        default=None,
+        metadata={
+            "help": "Controls the linear interpolation between the off-policy teacher logits and the on-policy logits "
+            "when sampling rollouts. A value of 1.0 uses only the teacher, 0.0 uses only the policy. If `None`, "
+            "logit fusion is disabled unless a teacher model is provided, in which case it defaults to 0.5."
+        },
+    )
+    logit_fusion_alpha_schedule: str | None = field(
+        default=None,
+        metadata={
+            "help": "Schedule for decaying logit_fusion_alpha during training. One of 'linear' or 'cosine'. If None, "
+            "logit fusion alpha stays constant."
+        },
+    )
+    logit_fusion_alpha_decay_steps: int = field(
+        default=1000,
+        metadata={
+            "help": "Number of optimizer steps over which to decay logit_fusion_alpha when a schedule is set."
+        },
+    )
+    use_fusion_importance_sampling: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, and logit fusion is enabled, save behavior policy logprobs from fused logits and use "
+            "them to compute importance sampling ratios against the current policy."
+        },
+    )
+    disable_importance_sampling_clipping: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, disable importance sampling clipping during the logit fusion alpha decay phase. After "
+            "decay, clipping is enabled."
+        },
+    )
+    use_importance_sampling_shaping: bool = field(
+        default=False,
+        metadata={
+            "help": "If True, apply a shaping function f(x)=x/(x+gamma) to importance sampling ratios."
+        },
+    )
+    importance_sampling_shaping_gamma: float = field(
+        default=0.1,
+        metadata={"help": "Gamma for the importance sampling shaping function f(x)=x/(x+gamma)."},
     )
     disable_dropout: bool = field(
         default=False,
@@ -413,6 +493,10 @@ class GRPOConfig(TrainingArguments):
             "help": "Batch size to use for generation. If `None`, it defaults to the effective training batch size: "
             "`per_device_train_batch_size * num_processes * steps_per_generation`."
         },
+    )
+    use_vllm_eval: bool = field(
+        default=True,
+        metadata={"help": "Whether to use vLLM for evaluation rollouts (train rollouts still use HF if use_vllm=False)."},
     )
     steps_per_generation: int | None = field(
         default=None,
@@ -576,6 +660,43 @@ class GRPOConfig(TrainingArguments):
         default=0.2,
         metadata={"help": "Epsilon value for clipping."},
     )
+    teacher_model_name_or_path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional frozen off-policy teacher model used for logit fusion during rollouts. Must share the "
+            "same vocabulary as the policy model."
+        },
+    )
+    teacher_model_revision: str | None = field(
+        default=None,
+        metadata={"help": "Revision of the teacher model to use (branch, tag, or commit hash)."},
+    )
+    use_max_value_clipping: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to use max-value IS ratio clipping during the logit-fusion alpha decay phase. When "
+            "enabled, PPO clipping is replaced by truncating IS ratios at `logit_fusion_is_ratio_clip_max` "
+            "regardless of advantage sign."
+        },
+    )
+    use_difficulty_alpha_scales: bool = field(
+        default=False,
+        metadata={"help": "Whether to scale logit-fusion alpha per sample using the `difficulty` field in inputs."},
+    )
+    difficulty_tier: str = field(
+        default="all",
+        metadata={
+            "help": "Difficulty filter for training data. Use 'all' for no filtering, a number N to keep "
+            "difficulty == N or N + 0.5, or a comparison like '< 4' or 'example[\"difficulty\"] < 4'."
+        },
+    )
+    logit_fusion_is_ratio_clip_max: float = field(
+        default=3.0,
+        metadata={
+            "help": "Max IS ratio used for logit-fusion decay phase clipping. During decay, PPO-style clipping is "
+            "replaced by truncating IS ratios at this value regardless of advantage sign."
+        },
+    )
     delta: float | None = field(
         default=None,
         metadata={
@@ -710,23 +831,30 @@ class GRPOConfig(TrainingArguments):
         default=None,
         metadata={"help": "Whether to use the Liger GRPO loss."},
     )
+    use_importance_sampling_correction: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to compute importance sampling ratios between the behavior policy and the old policy "
+            "during rollout scoring when a teacher model is present."
+        },
+    )
     vllm_importance_sampling_correction: bool = field(
-        default=True,
+        default=False,
         metadata={
             "help": "Whether to apply Importance Sampling (IS) to correct for the mismatch between vLLM "
             "completion logprobs and recomputed training logprobs. If set to `False`, no IS is applied "
-            "regardless of `vllm_importance_sampling_mode`. When `True`, the selected mode determines how "
+            "regardless of `importance_sampling_mode`. When `True`, the selected mode determines how "
             "IS ratios are computed and constrained."
         },
     )
 
-    vllm_importance_sampling_mode: str = field(
+    importance_sampling_mode: str = field(
         default="sequence_mask",
         metadata={
             "help": "Specifies how Importance Sampling (IS) is performed when "
             "vllm_importance_sampling_correction=True. Modes are defined along two orthogonal "
             "dimensions: (1) constraint, which determines how to handle ratios above "
-            "vllm_importance_sampling_cap (C)—either truncation (clip from above, ρ ← min(ρ, C)) or "
+            "importance_sampling_cap (C)—either truncation (clip from above, ρ ← min(ρ, C)) or "
             "masking (set ratios above C to zero); and (2) granularity, which determines whether "
             "ratios are computed per token or as a single sequence-level ratio applied to all tokens. "
             "Supported options are: 'token_truncate', 'token_mask', 'sequence_truncate', and "
@@ -734,10 +862,10 @@ class GRPOConfig(TrainingArguments):
         },
     )
 
-    vllm_importance_sampling_cap: float = field(
+    importance_sampling_cap: float = field(
         default=3.0,
         metadata={
-            "help": "Importance sampling cap C used by `vllm_importance_sampling_mode`. For '*_truncate' modes, "
+            "help": "Importance sampling cap C used by `importance_sampling_mode`. For '*_truncate' modes, "
             "ratios are clipped from above at C. For '*_mask' modes, ratios larger than C are set to zero."
         },
     )
@@ -818,6 +946,19 @@ class GRPOConfig(TrainingArguments):
                 "GRPO requires at least 2 generations per prompt to calculate the advantages. You provided "
                 f"{self.num_generations}, which is less than the minimum required."
             )
+
+        if self.logit_fusion_alpha is not None and not 0.0 <= self.logit_fusion_alpha <= 1.0:
+            raise ValueError("logit_fusion_alpha must be between 0.0 and 1.0.")
+        if self.logit_fusion_alpha_schedule is not None:
+            valid_schedules = {"linear", "cosine"}
+            if self.logit_fusion_alpha_schedule not in valid_schedules:
+                raise ValueError(
+                    "logit_fusion_alpha_schedule must be one of {}.".format(sorted(valid_schedules))
+                )
+            if self.logit_fusion_alpha_decay_steps <= 0:
+                raise ValueError("logit_fusion_alpha_decay_steps must be > 0.")
+        if self.logit_fusion_is_ratio_clip_max <= 1.0:
+            raise ValueError("logit_fusion_is_ratio_clip_max must be > 1.0.")
 
         if self.use_liger_loss is not None:
             warnings.warn(

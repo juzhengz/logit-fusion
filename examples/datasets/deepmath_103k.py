@@ -38,7 +38,7 @@ class ScriptArguments:
         metadata={"help": "Whether to push the dataset to the Hugging Face Hub."},
     )
     repo_id: str = field(
-        default="trl-lib/DeepMath-103K",
+        default="juzhengz/DeepMath-103K",
         metadata={"help": "Hugging Face repository ID to push the dataset to."},
     )
     dataset_num_proc: int | None = field(
@@ -74,6 +74,7 @@ tags: [trl]
 Column:
 - `"prompt"`: The input question.
 - `"solution"`: The solution to the math problem.
+- `"difficulty"`: Difficulty label from the source dataset.
 
 ## Generation script
 
@@ -86,9 +87,13 @@ if __name__ == "__main__":
 
     dataset = load_dataset("zwhe99/DeepMath-103K", split="train")
 
+    dataset = dataset.filter(lambda example: example["final_answer"] not in ["True", "False", "Yes", "No"])
+    dataset = dataset.filter(lambda example: example["difficulty"] != -1)
+
+    remove_columns = [col for col in dataset.column_names if col != "difficulty"]
     dataset = dataset.map(
         process_example,
-        remove_columns=dataset.column_names,
+        remove_columns=remove_columns,
         num_proc=script_args.dataset_num_proc,
     )
     dataset = dataset.train_test_split(test_size=0.05, seed=42)

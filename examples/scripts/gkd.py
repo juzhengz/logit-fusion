@@ -67,6 +67,8 @@ from trl import (
     get_quantization_config,
 )
 from trl.experimental.gkd import GKDConfig, GKDTrainer
+from trl.rewards import accuracy_reward
+from trl.import_utils import is_math_verify_available
 
 
 # Enable logging in a Hugging Face Space
@@ -126,6 +128,12 @@ if __name__ == "__main__":
     ################
     # Training
     ################
+    reward_func = None
+    solution_keys = {"solution", "answer", "final_answer"}
+    train_columns = set(dataset[script_args.dataset_train_split].column_names)
+    if is_math_verify_available() and train_columns.intersection(solution_keys):
+        reward_func = accuracy_reward
+
     trainer = GKDTrainer(
         model=model_args.model_name_or_path,
         teacher_model=training_args.teacher_model_name_or_path,
@@ -134,6 +142,7 @@ if __name__ == "__main__":
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
+        reward_func=reward_func,
     )
 
     if training_args.eval_strategy != "no":
